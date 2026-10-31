@@ -12,6 +12,22 @@ def test_repository_create_table_and_upsert():
         from sqlalchemy import text
 
         connection.execute(text("ATTACH DATABASE ':memory:' AS public"))
+        connection.execute(text(
+            "CREATE TABLE public.dim_currency "
+            "(currency_id TEXT PRIMARY KEY, currency_code TEXT UNIQUE NOT NULL)"
+        ))
+        connection.execute(text(
+            "CREATE TABLE public.dim_source "
+            "(source_id TEXT PRIMARY KEY, source_name TEXT NOT NULL, description TEXT)"
+        ))
+        connection.execute(text(
+            "CREATE TABLE public.dim_exchange_rate "
+            "(exchange_rate_id TEXT PRIMARY KEY, currency_id TEXT NOT NULL, "
+            "source_id TEXT NOT NULL, rate_date DATE NOT NULL, rate NUMERIC NOT NULL)"
+        ))
+        connection.execute(text(
+            "INSERT INTO public.dim_currency VALUES ('cop-id', 'COP')"
+        ))
         repo = ExchangeRateRepository(connection=connection)
         repo.create_table_if_not_exists()
 
@@ -46,3 +62,7 @@ def test_repository_create_table_and_upsert():
         ]
         updated = repo.upsert_rates(updated_rates)
         assert updated == 1
+        count = connection.execute(
+            text("SELECT count(*) FROM public.dim_exchange_rate")
+        ).scalar_one()
+        assert count == 2
