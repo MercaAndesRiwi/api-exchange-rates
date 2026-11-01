@@ -1,8 +1,9 @@
-"""PostgreSQL data access repository for exchange rates."""
+"""PostgreSQL adapter for the shared MercaAndes dimensions."""
 
 from __future__ import annotations
 
 from typing import Iterable
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
@@ -11,72 +12,98 @@ from exchange_rates.models import ExchangeRate
 
 
 class PostgreSQLExchangeRateRepository:
-    """PostgreSQL persistence implementation.
-
-    Fulfills the ExchangeRateRepository and SchemaInitializer protocols.
-    Receives connection via Dependency Injection (DIP).
-    """
+    """Persist Frankfurter rates in the POS dimensional schema."""
 
     def __init__(self, connection: Connection):
         self.connection = connection
 
     def create_table_if_not_exists(self) -> None:
-        """Create the public.exchange_rate table if it does not exist (SchemaInitializer)."""
+        """Validate that the POS migrations created the required dimensions."""
         self.connection.execute(
             text(
-                """
-                CREATE TABLE IF NOT EXISTS public.exchange_rate (
-                    rate_date DATE NOT NULL,
-                    base_currency_code VARCHAR(3) NOT NULL,
-                    quote_currency_code VARCHAR(3) NOT NULL,
-                    rate NUMERIC(18, 8) NOT NULL CHECK (rate > 0),
-                    source VARCHAR(50) NOT NULL DEFAULT 'Frankfurter',
-                    PRIMARY KEY (
-                        rate_date,
-                        base_currency_code,
-                        quote_currency_code
-                    )
-                )
-                """
+                "SELECT 1 FROM public.dim_currency, public.dim_source, "
+                "public.dim_exchange_rate LIMIT 0"
             )
         )
+
+    def _source_id(self, source_name: str) -> UUID:
+        source_id = self.connection.execute(
+            text(
+                "SELECT source_id FROM public.dim_source "
+                "WHERE source_name = :source_name ORDER BY source_id LIMIT 1"
+            ),
+            {"source_name": source_name},
+        ).scalar_one_or_none()
+        if source_id is not None:
+            return str(source_id)
+
+        source_id = uuid5(NAMESPACE_URL, f"mercaandes:data-source:{source_name}")
+        self.connection.execute(
+            text(
+                "INSERT INTO public.dim_source (source_id, source_name, description) "
+                "VALUES (:source_id, :source_name, :description)"
+            ),
+            {
+                "source_id": str(source_id),
+                "source_name": source_name,
+                "description": "Exchange rates provided by Frankfurter API",
+            },
+        )
+        source_id = self.connection.execute(
+            text(
+                "SELECT source_id FROM public.dim_source "
+                "WHERE source_name = :source_name ORDER BY source_id LIMIT 1"
+            ),
+            {"source_name": source_name},
+        ).scalar_one()
+        return str(source_id)
 
     def upsert_rates(self, rates: Iterable[ExchangeRate | dict]) -> int:
-        """Insert or update exchange rates idempotently."""
-        query = text(
-            """
-            INSERT INTO public.exchange_rate (
-                rate_date,
-                base_currency_code,
-                quote_currency_code,
-                rate,
-                source
-            )
-            VALUES (
-                :rate_date,
-                :base_currency_code,
-                :quote_currency_code,
-                :rate,
-                :source
-            )
-            ON CONFLICT (
-                rate_date,
-                base_currency_code,
-                quote_currency_code
-            )
-            DO UPDATE SET
-                rate = EXCLUDED.rate,
-                source = EXCLUDED.source
-            """
+        """Insert or update rates by currency, source, and date."""
+        affected = 0
+        currency_query = text(
+            "SELECT currency_id FROM public.dim_currency "
+            "WHERE currency_code = :currency_code"
+        )
+        update_query = text(
+            "UPDATE public.dim_exchange_rate SET rate = :rate "
+            "WHERE currency_id = :currency_id AND source_id = :source_id "
+            "AND rate_date = :rate_date"
+        )
+        insert_query = text(
+            "INSERT INTO public.dim_exchange_rate "
+            "(exchange_rate_id, currency_id, source_id, rate_date, rate) "
+            "VALUES (:exchange_rate_id, :currency_id, :source_id, :rate_date, :rate)"
         )
 
-        inserted = 0
         for item in rates:
-            param_dict = item.to_dict() if isinstance(item, ExchangeRate) else item
-            result = self.connection.execute(query, param_dict)
-            inserted += result.rowcount
+            rate = item.to_dict() if isinstance(item, ExchangeRate) else item
+            currency_id = self.connection.execute(
+                currency_query, {"currency_code": rate["quote_currency_code"]}
+            ).scalar_one_or_none()
+            if currency_id is None:
+                raise ValueError(
+                    "Currency is missing from public.dim_currency: "
+                    f"{rate['quote_currency_code']}"
+                )
 
-        return inserted
+            values = {
+                "currency_id": currency_id,
+                "source_id": self._source_id(rate["source"]),
+                "rate_date": rate["rate_date"],
+                "rate": rate["rate"],
+            }
+            result = self.connection.execute(update_query, values)
+            if result.rowcount:
+                affected += result.rowcount
+            else:
+                self.connection.execute(
+                    insert_query,
+                    {**values, "exchange_rate_id": str(uuid4())},
+                )
+                affected += 1
+
+        return affected
 
 
 # Backward compatibility alias
