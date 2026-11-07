@@ -76,20 +76,31 @@ class PostgreSQLExchangeRateRepository:
             "VALUES (:exchange_rate_id, :currency_id, :source_id, :rate_date, :rate)"
         )
 
+        currency_cache = {}
+        source_cache = {}
+
         for item in rates:
             rate = item.to_dict() if isinstance(item, ExchangeRate) else item
-            currency_id = self.connection.execute(
-                currency_query, {"currency_code": rate["quote_currency_code"]}
-            ).scalar_one_or_none()
-            if currency_id is None:
-                raise ValueError(
-                    "Currency is missing from public.dim_currency: "
-                    f"{rate['quote_currency_code']}"
-                )
+            c_code = rate["quote_currency_code"]
+            if c_code not in currency_cache:
+                c_id = self.connection.execute(
+                    currency_query, {"currency_code": c_code}
+                ).scalar_one_or_none()
+                if c_id is None:
+                    raise ValueError(
+                        f"Currency is missing from public.dim_currency: {c_code}"
+                    )
+                currency_cache[c_code] = c_id
+            currency_id = currency_cache[c_code]
+
+            s_name = rate["source"]
+            if s_name not in source_cache:
+                source_cache[s_name] = self._source_id(s_name)
+            source_id = source_cache[s_name]
 
             values = {
                 "currency_id": currency_id,
-                "source_id": self._source_id(rate["source"]),
+                "source_id": source_id,
                 "rate_date": rate["rate_date"],
                 "rate": rate["rate"],
             }
